@@ -651,11 +651,20 @@ class AIService:
             ],
             response_format={"type": "json_object"},
             temperature=0.0,
-            max_tokens=1200,
+            max_tokens=4096,
         )
 
         content = resp.choices[0].message.content
-        data = json.loads(content)
+        finish_reason = resp.choices[0].finish_reason
+        if finish_reason == "length":
+            import logging
+            logging.warning(f"parse_specification_from_pdf_bytes: response truncated (finish_reason=length), content[:200]={content[:200]!r}")
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            import logging
+            logging.error(f"parse_specification_from_pdf_bytes: JSON decode error: {e}. content[:500]={content[:500]!r}")
+            return []
 
         items = data.get("items", [])
         if not isinstance(items, list):
