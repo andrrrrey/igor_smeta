@@ -114,6 +114,80 @@ class AIService:
         self.parse_mass_keys: List[str] = ['масса', 'вес', 'mass', 'weight']
         self.parse_note_keys: List[str] = ['примечание', 'примечания', 'note']
 
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        if not text or len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip() + "\n...[truncated]"
+
+    def _compact_rag_context(self, docs: List[str], max_docs: int = 4, max_chars_per_doc: int = 700) -> str:
+        if not docs:
+            return "Нет данных из RAG."
+        compact_docs = [self._truncate_text(doc, max_chars_per_doc) for doc in docs[:max_docs]]
+        return "\n\n".join(compact_docs)
+
+    def _compact_pricelist_context(self, pricelist_context: Dict[str, float], max_items: int = 5) -> str:
+        if not pricelist_context:
+            return "Нет аналогов в прайс-листе."
+        compact = dict(list(pricelist_context.items())[:max_items])
+        return json.dumps(compact, ensure_ascii=False)
+
+    async def _get_market_price_fallback(self, item_name: str, item_code: Optional[str]) -> Dict:
+        client = self._get_client()
+        if not client:
+            return {"price": 0.0, "source": "not_found"}
+
+        item_code_str = item_code.strip() if item_code and item_code.strip() else "Не указан"
+        prompt = f"""
+        [РОЛЬ] Ты — сметчик по монтажным работам.
+        [ЗАДАЧА] Назови среднерыночную цену монтажа для одной позиции.
+
+        [ВХОДНЫЕ ДАННЫЕ]
+        1. Наименование: "{item_name}"
+        2. Код/артикул: "{item_code_str}"
+
+        [ПРАВИЛА]
+        * Используй только общие знания о типовой рыночной цене.
+        * Если позиция выглядит как обычное оборудование или материал с монтажом, не возвращай 0 без крайней необходимости.
+        * Если уверенной оценки нет, верни "not_found".
+        * Ответь только JSON.
+
+        [ФОРМАТ]
+        {{"price": (float), "source": "internet" | "not_found"}}
+        """
+
+        content = None
+        try:
+            model_name_only = self.model.split('@')[0]
+            response = await client.chat.completions.create(
+                model=model_name_only,
+                messages=[
+                    {"role": "system", "content": "Ты — ИИ-ассистент для расчета смет. Отвечай только JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=220
+            )
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            price = float(data.get("price", 0.0))
+            source = str(data.get("source", "not_found"))
+            if source not in {"internet", "not_found"}:
+                source = "not_found"
+            if price <= 0:
+                return {"price": 0.0, "source": "not_found"}
+            return {"price": price, "source": source}
+        except OpenAIError as e:
+            print(f"API error ({model_name_only}) in _get_market_price_fallback: {e}")
+            return {"price": 0.0, "source": "not_found"}
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            print(f"AI parse error in _get_market_price_fallback: {e}. Response was: {content}")
+            return {"price": 0.0, "source": "not_found"}
+        except Exception as e:
+            print(f"Unexpected error in _get_market_price_fallback: {e}")
+            return {"price": 0.0, "source": "not_found"}
+
     async def update_settings(self, settings: BotSettings):
         if settings.openai_api_key:
             self.openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -166,7 +240,7 @@ class AIService:
             if "billing" in str(e).lower():
                 return {"price": 0.0, "source": "not_found"}
 
-        context = "\n".join(rag_info) if rag_info else "Нет данных из RAG."
+        context = self._compact_rag_context(rag_info, max_docs=3, max_chars_per_doc=500)
 
         user_prompt = f"""
         [РОЛЬ] Ты — ИИ-ассистент, эксперт по составлению смет на монтажные работы.
@@ -204,7 +278,8 @@ class AIService:
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.0
+                temperature=0.0,
+                max_tokens=300
             )
             content = response.choices[0].message.content
             data = json.loads(content)
@@ -263,7 +338,7 @@ class AIService:
                 queries_to_run.add(f"{short_name_2}")
 
             for query_text in queries_to_run:
-                rag_docs = await self.vector_db.query(query_text, n_results=10)
+                rag_docs = await self.vector_db.query(query_text, n_results=4)
                 all_rag_results.update(rag_docs)
 
         except ValueError as e:
@@ -271,48 +346,46 @@ class AIService:
             if "billing" in str(e).lower():
                 return {"price": 0.0, "source": "not_found"}
 
-        rag_context = "\n".join(list(all_rag_results)) if all_rag_results else "Нет данных из RAG."
+        rag_context = self._compact_rag_context(sorted(all_rag_results), max_docs=4, max_chars_per_doc=500)
 
         candidates = process.extractBests(
             item_name,
             pricelist_cache.keys(),
             scorer=fuzz.token_set_ratio,
             score_cutoff=70,
-            limit=10
+            limit=5
         )
         pricelist_context = {name: pricelist_cache[name] for name, score in candidates}
-        pricelist_context_str = json.dumps(pricelist_context,
-                                           ensure_ascii=False) if pricelist_context else "Нет аналогов в прайс-листе."
+        pricelist_context_str = self._compact_pricelist_context(pricelist_context, max_items=5)
 
         item_code_str = item_code if item_code and item_code.strip() else "Не указан"
 
         user_prompt = f"""
-        [ЗАДАЧА] Определи цену для ОДНОЙ позиции, следуя инструкциям из СИСТЕМНОГО промпта.
+        [ЗАДАЧА] Выбери лучший локальный источник цены для ОДНОЙ позиции.
 
         [КРИТИЧЕСКОЕ ПРАВИЛО АНАЛОГИЙ]
-        * Твой СИСТЕМНЫЙ промпт требует, чтобы ты находил аналоги. Делай это!
-        * Пример 1: "IP-камера купольная" и "Видеокамера IP цилиндрическая" — это ОДНА категория ("Видеокамера").
-        * Пример 2: "NVR-50" — это "Видеорегистратор".
-        * Используй [RAG_CONTEXT] и [PRICELIST_ANALOGS] **агрессивно**. Если ты видишь аналог по категории (даже если модель/тип (купольная/цилиндрическая) немного отличается) — **ИСПОЛЬЗУЙ ЕГО ЦЕНУ**.
-        * Не отвечай "not_found", если в контексте есть позиция той же *категории*.
-
-        [ПРАВИЛО ОБЩИХ ЗНАНИЙ (ИНТЕРНЕТ)]
-        * Если [RAG_CONTEXT] и [PRICELIST_ANALOGS] не помогли, **ИСПОЛЬЗУЙ СВОИ ОБЩИЕ ЗНАНИЯ (Интернет)**, чтобы дать среднерыночную цену.
-        * Нельзя возвращать 0.0 для **обычных** позиций, таких как 'Видеокамера' или 'Коммутатор'. Ты *знаешь* примерную цену их монтажа.
-        * Если используешь "internet", ты **ОБЯЗАН** заполнить поле "explanation".
+        * Ищи аналог по категории, а не только по точному совпадению модели.
+        * Пример 1: "IP-камера купольная" и "Видеокамера IP цилиндрическая" — одна категория.
+        * Пример 2: "NVR-50" может быть аналогом категории "Видеорегистратор".
+        * Если в RAG или прайс-листе уже есть хороший аналог той же категории, выбери его.
+        * Если надежного локального аналога нет, верни "internet".
 
         [ВХОДНЫЕ ДАННЫЕ]
         1. [ITEM_TO_PRICE_NAME]: "{item_name}"
         2. [ITEM_TO_PRICE_CODE]: "{item_code_str}"
 
-        [КОНТЕКСТ ДЛЯ ПОИСКА]
+        [ЛОКАЛЬНЫЙ КОНТЕКСТ]
         1. [RAG_CONTEXT]: {rag_context}
         2. [PRICELIST_ANALOGS]: {pricelist_context_str}
 
         [ФОРМАТ ОТВЕТА]
-        * Ответь **ТОЛЬКО** валидным JSON-объектом: {{"price": (float), "source": "(string)", "explanation": "(string)"}}
-        * "source": "rag", "internal", "internet" или "not_found".
-        * "explanation": (string) **ОБЯЗАТЕЛЬНО** заполни, если source="internet". (Пример: "Среднерыночная цена монтажа видеокамеры"). Если source не "internet", оставь "".
+        Ответь только JSON:
+        {{"source": "rag" | "internal" | "internet" | "not_found", "price": (float), "match": "(string)", "reason": "(string)"}}
+
+        [ПРАВИЛА ОТВЕТА]
+        * Если source="internal" или source="rag", укажи ненулевую price.
+        * Если локального совпадения нет, верни source="internet" и price=0.
+        * Если позицию совсем нельзя интерпретировать, верни source="not_found" и price=0.
         """
 
         content = None
@@ -325,7 +398,8 @@ class AIService:
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.3
+                temperature=0.3,
+                max_tokens=350
             )
             content = response.choices[0].message.content
             data = json.loads(content)
@@ -335,8 +409,12 @@ class AIService:
 
             if source == "internal" and price == 0.0:
                 source = "not_found"
+            if source in {"internal", "rag"} and price > 0.0:
+                return {"price": price, "source": source}
+            if source == "not_found":
+                return {"price": 0.0, "source": "not_found"}
 
-            return {"price": price, "source": source}
+            return await self._get_market_price_fallback(item_name, item_code)
 
         except OpenAIError as e:
             print(f"API error ({model_name_only}): {e}")
@@ -468,7 +546,7 @@ class AIService:
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.0,
-                max_tokens=4000
+                max_tokens=1200
             )
             content = response.choices[0].message.content
             data = json.loads(content)
@@ -573,7 +651,7 @@ class AIService:
             ],
             response_format={"type": "json_object"},
             temperature=0.0,
-            max_tokens=4000,
+            max_tokens=1200,
         )
 
         content = resp.choices[0].message.content
